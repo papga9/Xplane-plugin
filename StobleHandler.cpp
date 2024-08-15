@@ -1,168 +1,116 @@
-// Downloaded from https://developer.x-plane.com/code-sample/beacons-and-strobes/
-
-
-/*
-/*
-
-	Beacon and strobe example plugin.
-	
-	This plugin overrides X-Plane's default flash patterns for the beacons and strobes.  It provides a multi-part pulse for the strobes,
-	and sets the beacons to run at different rates.
-
-*/
-
-#include "XPLMDataAccess.h"
-#include "XPLMProcessing.h"
-#include "XPLMUtilities.h"
-
+#include <XPLMDisplay.h>
+#include <XPLMGraphics.h>
+#include <XPLMProcessing.h>
+#include <XPLMUtilities.h>
+#include <XPLMDataAccess.h>
 #include <string.h>
-#include <math.h>
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <arpa/inet.h>
+#include <unistd.h>
+#if IBM
+	#include <windows.h>
+#endif
+#if LIN
+	#include <GL/gl.h>
+#elif __GNUC__
+	#include <OpenGL/gl.h>
+#else
+	#include <GL/gl.h>
+#endif
 
-// The time stamp that the strobes last fired.
-float strobe1_t = 0.0, strobe2_t = 0.0;
+#ifndef XPLM300
+	#error This is made to be compiled against the XPLM300 SDK
+#endif
 
-/* This is the period of the entire strobe sequence. */
-#define STROBE_TIME 1.0
+#define SERVER_IP "127.0.0.1"
+#define SERVER_PORT 8080
+#define BUFFER_SIZE 1024
 
-/* This is the time between the first and second strobe firing. */
-#define STROBE_OFFSET 0.2
+static XPLMWindowID g_window;
+static char g_display_data[BUFFER_SIZE] = "Waiting for data...";
+static int g_sock = 0;
+static std::atomic<bool> g_running(true);
+static std::thread g_thread;
+static int g_toggle_strobe = 0;
 
-static XPLMDataRef override_beacons_and_strobes = NULL;
-
-// These tell us if the strobes and beacons are really on.  They take into consideration both the switch positions and electrical failures.	
-static XPLMDataRef beacon_lights_on = NULL;
-static XPLMDataRef strobe_lights_on = NULL;
-
-// When we are overriding beacons and strobes, we are responsible for writing each of these per frame. 
-// These are four-item arrays, so we can make multiple strobe flash patterns and separately running beacons.
-static XPLMDataRef beacon_brightness_ratio = NULL;
-static XPLMDataRef strobe_brightness_ratio = NULL;
-// Set this to 1 if ANY strobe is on - this is what makes the clouds light up, etc.
-static XPLMDataRef strobe_flash_now = NULL;
-
-// Deferred init.  Plugins should wait until the sim is really running to do final
-// initialization.  See http://www.xsquawkbox.net/xpsdk/mediawiki/DeferredInitialization
-// for more info.
-static float deferred_init(
-                                   float                inElapsedSinceLastCall,    
-                                   float                inElapsedTimeSinceLastFlightLoop,    
-                                   int                  inCounter,    
-                                   void *               inRefcon)
-{
-	XPLMSetDatai(override_beacons_and_strobes,1);
-	
-	strobe1_t = XPLMGetElapsedTime();
-	strobe2_t = strobe1_t + STROBE_OFFSET;
-	return 0;
+void TCPClientThread() {
+    char buffer[BUFFER_SIZE] = {0};
+    while (g_running.load()) {
+        int valread = read(g_sock, buffer, BUFFER_SIZE);
+        if (valread > 0) {
+            if (buffer[0] == 'A') {
+                XPLMDataRef icao_ref = XPLMFindDataRef("sim/aircraft/view/acf_ICAO");
+                XPLMGetDatab(icao_ref, g_display_data, 0, sizeof(g_display_data));
+            } else if (buffer[0] == 'B') {
+                XPLMDataRef strobe_ref = XPLMFindDataRef("sim/cockpit/electrical/strobe_lights_on");
+                g_toggle_strobe = !XPLMGetDatai(strobe_ref);
+                XPLMSetDatai(strobe_ref, g_toggle_strobe);
+            }
+        }
+    }
 }
 
-// This is our main per-frame lighting function.  This is where we do the work X-plane would normally
-// do to calculate what the beacons and strobes are doing.
-static float lights_per_frame(
-                                   float                inElapsedSinceLastCall,    
-                                   float                inElapsedTimeSinceLastFlightLoop,    
-                                   int                  inCounter,    
-                                   void *               inRefcon)
-{
-	float now = XPLMGetElapsedTime();
-	float beacons[4] = { 0 };
-	float flash[4] = { 0 };
-	int	any_flash = 0;	
-	int strobes_on = XPLMGetDatai(strobe_lights_on);
-	
-	if(beacon_lights_on == NULL || strobe_lights_on == NULL || beacon_brightness_ratio == NULL)
-	{
-		XPLMDebugString("We are missing our datarefs.\n");
-		return 0.0f;
-	}
+void MyDrawWindowCallback(XPLMWindowID in_window_id, void *in_refcon) {
+    int left, top, right, bottom;
+    XPLMGetWindowGeometry(in_window_id, &left, &top, &right, &bottom);
 
-	// Beacon lighting calculation.  If the beacons are on, use sine and cosine for the two
-	// beacons...and use a slightly different scale so they run at different spededs.
-
-	if(XPLMGetDatai(beacon_lights_on))
-	{
-		beacons[0] = sin(now * 1.5);
-		beacons[1] = cos(now);
-	}
-	XPLMSetDatavf(beacon_brightness_ratio,beacons,0,4);	
-
-	// Strobes.  Each time we are past our "strobe time", flash for one frame, then go out again.
-	// Note that this is a TERRIBLE strobing algorithm: at high fps the strobes are on for TINY amounts of time.
-	// In your strobing algorithm, make sure the strobes are on for the longer of one frame or a certain minimum time.
-	// Some users do run at 80+ fps!
-
-	
-	if ((now - strobe1_t) > STROBE_TIME)
-	{
-		flash[0] = strobes_on;
-		any_flash |= strobes_on;
-		strobe1_t += STROBE_TIME;
-	}
-	if ((now - strobe2_t) > STROBE_TIME)
-	{
-		flash[1] = strobes_on;
-		any_flash |= strobes_on;
-		strobe2_t += STROBE_TIME;
-	}
-
-	XPLMSetDatavf(strobe_brightness_ratio,flash,0,4);
-	XPLMSetDatai(strobe_flash_now, any_flash);
-
-	return -1.0;	
+    XPLMDrawString(XPLM_COLOR_WHITE, left + 10, top - 20, g_display_data, NULL, xplmFont_Basic);
 }
 
-
-PLUGIN_API int XPluginStart(
-						char *		outName,
-						char *		outSig,
-						char *		outDesc)
-{
-	strcpy(outName, "Custom Beacons/Strobes Example");
-	strcpy(outSig, "xplanesdk.examples.custom_beacons_strobes");
-	strcpy(outDesc, "A plugin that demonstrates custom beacon/strobe patterns.");
-
-	override_beacons_and_strobes = XPLMFindDataRef("sim/flightmodel2/lights/override_beacons_and_strobes");
-	
-	if(override_beacons_and_strobes == NULL)
-	{
-		XPLMDebugString("Beacon and strobe plugin disabled - this version of x-plane doesn't support the feature.\n");
-		return 0;
-	}
-
-	beacon_lights_on = XPLMFindDataRef("sim/cockpit/electrical/beacon_lights_on");
-	strobe_lights_on = XPLMFindDataRef("sim/cockpit/electrical/strobe_lights_on");
-	beacon_brightness_ratio = XPLMFindDataRef("sim/flightmodel2/lights/beacon_brightness_ratio");
-	strobe_brightness_ratio = XPLMFindDataRef("sim/flightmodel2/lights/strobe_brightness_ratio");
-	strobe_flash_now = XPLMFindDataRef("sim/flightmodel2/lights/strobe_flash_now");	
-
-	XPLMRegisterFlightLoopCallback(deferred_init, -1.0, NULL);
-	XPLMRegisterFlightLoopCallback(lights_per_frame, -2.0, NULL);
-	
-	
-	return 1;
+void MyHandleMouseClickCallback(XPLMWindowID in_window_id, int x, int y, XPLMMouseStatus in_mouse, void *in_refcon) {
+    // Do nothing for now
 }
 
-PLUGIN_API void	XPluginStop(void)
-{
-	XPLMUnregisterFlightLoopCallback(deferred_init,NULL);
-	XPLMUnregisterFlightLoopCallback(lights_per_frame,NULL);
-	XPLMSetDatai(override_beacons_and_strobes,0);
+PLUGIN_API int XPluginStart(char *outName, char *outSig, char *outDesc) {
+    strcpy(outName, "TCPClientPlugin");
+    strcpy(outSig, "xpsdk.examples.tcpclient");
+    strcpy(outDesc, "A plugin that acts as a TCP client and performs actions based on received data.");
 
+    // Create the window
+    int left = 100;
+    int top = 600;
+    int right = 600;
+    int bottom = 500;
+    g_window = XPLMCreateWindow(left, top, right, bottom, 1, MyDrawWindowCallback, MyHandleMouseClickCallback, NULL, NULL);
+
+    // Setup TCP client
+    struct sockaddr_in serv_addr;
+    if ((g_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Socket creation error");
+        return 0;
+    }
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(SERVER_PORT);
+
+    if (inet_pton(AF_INET, SERVER_IP, &serv_addr.sin_addr) <= 0) {
+        perror("Invalid address/Address not supported");
+        return 0;
+    }
+
+    if (connect(g_sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("Connection Failed");
+        return 0;
+    }
+
+    // Create a thread to handle the TCP client
+    g_thread = std::thread(TCPClientThread);
+
+    return 1;
 }
 
-PLUGIN_API void XPluginDisable(void)
-{
+PLUGIN_API void XPluginStop(void) {
+    g_running.store(false);
+    if (g_thread.joinable()) {
+        g_thread.join();
+    }
+    close(g_sock);
+    XPLMDestroyWindow(g_window);
 }
 
-PLUGIN_API int XPluginEnable(void)
-{
-	return 1;
-}
+PLUGIN_API void XPluginDisable(void) {}
 
-PLUGIN_API void XPluginReceiveMessage(
-					XPLMPluginID	inFromWho,
-					int				inMessage,
-					void *			inParam)
-{
-}
+PLUGIN_API int XPluginEnable(void) { return 1; }
 
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID inFromWho, int inMessage, void *inParam) {}
