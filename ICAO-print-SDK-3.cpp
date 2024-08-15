@@ -7,8 +7,8 @@
 #if LIN
 	#include <GL/gl.h>
 #elif __GNUC__
-	#include <OpenGL/gl.h>
-#elser
+	#include <GLFW/glfw3.h>
+#else
 	#include <GL/gl.h>
 #endif
 
