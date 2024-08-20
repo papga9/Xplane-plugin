@@ -15,7 +15,7 @@
 #if LIN
 	#include <GL/gl.h>
 #elif __GNUC__
-	#include <OpenGL/gl.h>
+	#include <GLFW/glfw3.h>
 #else
 	#include <GL/gl.h>
 #endif
